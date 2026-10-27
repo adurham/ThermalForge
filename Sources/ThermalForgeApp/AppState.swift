@@ -14,7 +14,11 @@ final class AppState: ObservableObject {
     @Published var latestStatus: ThermalStatus?
     @Published var activeProfile: FanProfile = .silent
     @Published var monitorState: MonitorState = .idle
-    @Published var maxTemp: Float?
+    /// Rounded Celsius peak shown in the menu bar label, or nil before the first
+    /// sample. Published only when the rendered label changes (see
+    /// `MenuBarLabelGate`): the label is an `NSStatusItem` that AppKit re-snapshots
+    /// on every publish, so a 0.1°C sensor wobble must never reach SwiftUI.
+    @Published private(set) var menuBarTempC: Int?
     @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
         didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
     }
@@ -56,6 +60,10 @@ final class AppState: ObservableObject {
     /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
     /// or hung daemon can never stall the UI run loop (the v0.1.7 freeze).
     private let heartbeatQueue = DispatchQueue(label: "com.thermalforge.heartbeat", qos: .utility)
+    /// Suppresses publishes that would not change the rendered menu bar label.
+    private var labelGate = MenuBarLabelGate()
+    /// True while the dropdown is on screen; live values then publish every tick.
+    private var isMenuOpen = false
     /// Off-main, serial, coalescing pump for all daemon-bound fan writes (launch
     /// adopt + monitor ramp commands). It owns its own queue, so this @MainActor
     /// class never runs socket I/O on the main actor — off-main by construction,
@@ -235,14 +243,18 @@ final class AppState: ObservableObject {
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if didReadVersion { self.daemonVersionMismatch = versionValue }
-                if didReadState { self.externalHold = holdValue }
+                if didReadVersion, self.daemonVersionMismatch != versionValue {
+                    self.daemonVersionMismatch = versionValue
+                }
+                if didReadState, self.externalHold != holdValue {
+                    self.externalHold = holdValue
+                }
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
                 if hbOK {
                     self.heartbeatFailures = 0
-                    self.daemonUnreachable = false
+                    if self.daemonUnreachable { self.daemonUnreachable = false }
                 } else {
                     self.heartbeatFailures += 1
                     if self.heartbeatFailures >= 2 { self.daemonUnreachable = true }
@@ -345,15 +357,7 @@ final class AppState: ObservableObject {
         let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile)
         monitor.onUpdate = { [weak self] status, profile, state in
             Task { @MainActor [weak self] in
-                self?.latestStatus = status
-                self?.activeProfile = profile
-                self?.monitorState = state
-                // Max of only the displayed sensors
-                // Peak across all CPU and GPU sensors for menu bar display
-                let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                self?.maxTemp = status.temperatures
-                    .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
-                    .values.max()
+                self?.publish(status, profile: profile, state: state)
             }
         }
         monitor.onFanCommand = { [weak self] command in
@@ -372,6 +376,46 @@ final class AppState: ObservableObject {
         }
         monitor.start()
         self.monitor = monitor
+    }
+
+    // MARK: - Menu bar publishing
+
+    /// Sensor families the label is allowed to peak over (CPU + GPU).
+    private static let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
+
+    /// Peak of the displayed sensors, truncated to whole °C — the same text the
+    /// label has always shown, and stable enough that sensor noise cannot churn it.
+    private static func displayTempC(_ status: ThermalStatus) -> Int? {
+        status.temperatures
+            .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
+            .values.max()
+            .map { Int($0) }
+    }
+
+    /// Publish the monitor's snapshot — but only when the rendered label changes.
+    /// The monitor fires at 2 Hz; publishing each tick re-rendered and re-snapshotted
+    /// the status item, measured at ~13% of a core for a static temperature.
+    private func publish(_ status: ThermalStatus, profile: FanProfile, state: MonitorState) {
+        let label = MenuBarLabelGate.Label(
+            tempC: Self.displayTempC(status),
+            state: state,
+            badge: daemonVersionMismatch != nil
+        )
+        guard labelGate.shouldPublish(label, menuOpen: isMenuOpen) else { return }
+        latestStatus = status
+        activeProfile = profile
+        monitorState = state
+        menuBarTempC = label.tempC
+    }
+
+    /// Dropdown appeared or vanished: while it is on screen the user is watching
+    /// live values, so every tick publishes; opening also pushes the freshest
+    /// snapshot immediately so the menu never shows numbers from the last publish.
+    func menuVisibilityChanged(_ visible: Bool) {
+        guard visible != isMenuOpen else { return }
+        isMenuOpen = visible
+        guard visible, let monitor, let status = monitor.latestStatus else { return }
+        publish(status, profile: monitor.activeProfile, state: monitor.state)
     }
 
     // MARK: - Actions

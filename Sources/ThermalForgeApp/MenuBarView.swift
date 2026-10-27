@@ -181,6 +181,9 @@ struct MenuBarView: View {
             .padding(.bottom, 10)
         }
         .frame(width: 260)
+        // Live numbers only while the dropdown is actually on screen; the window
+        // itself reports that, because onAppear/onDisappear do not track it.
+        .background(MenuWindowVisibility { appState.menuVisibilityChanged($0) })
     }
 
     // MARK: - Helpers

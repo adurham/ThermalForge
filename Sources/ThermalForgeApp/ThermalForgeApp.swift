@@ -49,7 +49,7 @@ struct ThermalForgeApp: App {
         } label: {
             MenuBarLabel(
                 state: appState.monitorState,
-                maxTemp: appState.maxTemp,
+                tempC: appState.menuBarTempC,
                 fahrenheit: appState.useFahrenheit,
                 needsDaemonUpdate: appState.daemonVersionMismatch != nil
             )
@@ -62,7 +62,9 @@ struct ThermalForgeApp: App {
 
 struct MenuBarLabel: View {
     let state: MonitorState
-    let maxTemp: Float?
+    /// Rounded Celsius, already reduced by `AppState` so a Float cannot churn the
+    /// status-item snapshot on every monitor tick.
+    let tempC: Int?
     var fahrenheit: Bool = false
     var needsDaemonUpdate: Bool = false
 
@@ -79,9 +81,9 @@ struct MenuBarLabel: View {
                             .offset(x: 3, y: -2)
                     }
                 }
-            if let tempC = maxTemp {
-                let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
-                Text("\(Int(display))°")
+            if let tempC {
+                let display = fahrenheit ? Int(Double(tempC) * 9 / 5 + 32) : tempC
+                Text("\(display)°")
                     .font(.system(.caption, design: .monospaced))
             }
         }
