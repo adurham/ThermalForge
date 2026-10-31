@@ -11,6 +11,7 @@
 
 import Darwin
 import Foundation
+import IOKit.ps
 
 // MARK: - Fan Commands
 
@@ -59,7 +60,23 @@ public final class ThermalMonitor {
     // MARK: - Tick Timing
 
     /// Thermal tick interval in seconds. Fan control runs at this rate.
-    private let tickInterval: Float
+    ///
+    /// Mutated when the power source changes (see `refreshPowerSourceCadence`).
+    /// Every per-tick ramp step and every seconds-based window is scaled by this
+    /// value, so changing the cadence keeps the physics correct instead of
+    /// silently stretching a 3s ramp into 30s.
+    private var tickInterval: Float
+
+    /// The interval the caller asked for — the AC cadence (0.1s by default).
+    private var configuredInterval: TimeInterval = 0.1
+
+    /// The interval the timer is currently armed with.
+    private var tickIntervalSeconds: TimeInterval = 0.1
+
+    /// Cadence while on battery. The SMC read is the whole cost of a tick, and a
+    /// laptop idling on battery does not need a 10 Hz control loop; a second of
+    /// added latency before the fans spin up is not something anyone can feel.
+    private static let batteryInterval: TimeInterval = 1.0
 
     /// Monitor cadence: process capture + anomaly detection every N thermal ticks.
     /// At 100ms thermal tick, 20 × 0.1s = 2 seconds.
@@ -129,13 +146,52 @@ public final class ThermalMonitor {
     public func start(interval: TimeInterval = 0.1) {
         stop()
 
+        configuredInterval = interval
+        tickIntervalSeconds = interval
+        tickInterval = Float(interval)
+        armTimer()
+    }
+
+    /// (Re)arm the timer at the current cadence. Called on start, and whenever a
+    /// power-source change moves the cadence.
+    private func armTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: interval)
+        timer.schedule(deadline: .now(), repeating: tickIntervalSeconds)
         timer.setEventHandler { [weak self] in
             self?.tick()
         }
         timer.resume()
         self.timer = timer
+    }
+
+    /// Is the machine running on its battery right now?
+    private static func onBattery() -> Bool {
+        guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(blob)?.takeRetainedValue() as? String
+        else { return false }
+        return type == kIOPSBatteryPowerValue
+    }
+
+    /// The cadence a given power source should run at. Pure so it can be tested
+    /// without a battery, a timer or an SMC connection.
+    static func cadence(configured: TimeInterval, onBattery: Bool) -> TimeInterval {
+        onBattery ? max(batteryInterval, configured) : configured
+    }
+
+    /// Slow the control loop down while on battery: same logic, a tenth of the
+    /// SMC reads and wakeups. Re-checked once every ~5s of ticks (one syscall
+    /// per window, not one per tick) so plugging in restores 10 Hz promptly.
+    private func refreshPowerSourceCadence() {
+        let desired = Self.cadence(configured: configuredInterval, onBattery: Self.onBattery())
+        guard abs(desired - tickIntervalSeconds) > 0.001 else { return }
+        tickIntervalSeconds = desired
+        // Ramp steps and every seconds-based window read this, so the cadence
+        // change stays dimensionally correct (a 3s sustained trigger is still 3s).
+        tickInterval = Float(desired)
+        timer?.cancel()
+        timer = nil
+        armTimer()
+        TFLogger.shared.info("Power source changed — thermal tick cadence \(Int(desired * 1000))ms")
     }
 
     public func stop() {
@@ -171,6 +227,12 @@ public final class ThermalMonitor {
     // MARK: - Polling
 
     private func tick() {
+        // Once per ~5s of ticks (not per tick): a power-source change re-arms the
+        // timer at 0.1s on AC or 1s on battery.
+        if tickCounter % 50 == 0 {
+            refreshPowerSourceCadence()
+        }
+
         guard let status = try? fanControl.status() else { return }
         latestStatus = status
 
